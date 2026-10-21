@@ -98,6 +98,53 @@ def make_case(rows, ctx, seed) -> Case:
     return Case(dense, lens, data, (k_fp4[:width], k_sf[:width]), k_cache, page_table)
 
 
+def make_multi_case(ctxs, rows_per_req, seed) -> Case:
+    """Several requests of odd compressed lengths: the later requests' starts are
+    not multiples of the candidate block size, exercising unaligned ks."""
+    from deep_gemm import fp8_fp4_mqa_logits
+
+    torch.manual_seed(seed)
+    dev = "cuda"
+    assert len(ctxs) == len(rows_per_req)
+    total_rows = sum(rows_per_req)
+    q_fp4, q_sf = quantize_fp4_indexer_tensor(
+        torch.randn(total_rows * HEADS, DIM, device=dev, dtype=torch.bfloat16),
+        rne=True,
+    )
+    q_fp4, q_sf = q_fp4.view(total_rows, HEADS, 64), q_sf.view(total_rows, HEADS)
+    weights = torch.rand(total_rows, HEADS, device=dev)
+    values, scales, starts, lens = [], [], [], []
+    offset = 0
+    for ctx, rows in zip(ctxs, rows_per_req):
+        k_fp4, k_sf = quantize_fp4_indexer_tensor(
+            torch.randn(ctx, DIM, device=dev, dtype=torch.bfloat16), rne=True
+        )
+        values.append(k_fp4)
+        scales.append(k_sf)
+        starts.append(torch.full((rows,), offset, dtype=torch.int32, device=dev))
+        lens.append(
+            torch.linspace(ctx - rows + 1, ctx, rows, device=dev).to(torch.int32)
+        )
+        offset += ctx
+    starts, lens = torch.cat(starts), torch.cat(lens)
+    kv = (torch.cat(values), torch.cat(scales))
+    width = (max(ctxs) + 7) // 8 * 8
+    dense = fp8_fp4_mqa_logits(
+        (q_fp4, q_sf), kv, weights, starts, starts + lens, False, width
+    )
+    data = DeepGEMMPrefillData(
+        k_slots=torch.arange(offset, device=dev),
+        request_starts=starts,
+        lens_per_request=list(ctxs),
+        rows_per_request=list(rows_per_req),
+        compress_lens=lens,
+        q_fp4=q_fp4,
+        q_sf=q_sf,
+        weights=weights,
+    )
+    return Case(dense, lens, data, kv, None, None)
+
+
 def rows_of(data: DeepGEMMPrefillData, idx: torch.Tensor) -> DeepGEMMPrefillData:
     """The operands of a subset of rows (one request)."""
     return msgspec.structs.replace(
@@ -183,6 +230,64 @@ def select_dense(blocks, case: Case):
         topk=TOPK,
         blocks=blocks,
         block_size=BLOCK,
+    )
+
+
+def publish_varlen(case: Case):
+    """(the varlen sparse table, the source layer's own top-k)."""
+    from sglang.srt.layers.attention.dsv4.v41_indexer.sparse_varlen import (
+        publish_varlen_prefill,
+    )
+    from sglang.srt.layers.attention.dsv4.v41_indexer.types import Selection
+
+    own = case.data.empty_selection(TOPK)
+    table = publish_varlen_prefill(
+        data=case.data,
+        kv=case.kv,
+        topk=TOPK,
+        topk_blocks=TOPK_BLOCKS,
+        out=Selection(page_indices=torch.empty_like(own), raw_indices=own),
+    )
+    return table, own
+
+
+def select_varlen(table, data: DeepGEMMPrefillData, kv: tuple):
+    from sglang.srt.layers.attention.dsv4.v41_indexer.sparse_varlen import (
+        consume_varlen_prefill,
+    )
+    from sglang.srt.layers.attention.dsv4.v41_indexer.types import Selection
+
+    positions = data.empty_selection(TOPK)
+    consume_varlen_prefill(
+        data=data,
+        kv=kv,
+        published=table,
+        topk=TOPK,
+        out=Selection(page_indices=torch.empty_like(positions), raw_indices=positions),
+    )
+    # write_selection emits flattened-K positions minus the request start.
+    positions.add_(torch.where(positions >= 0, data.request_starts[:, None], 0))
+    return positions
+
+
+def relative_picks(positions: torch.Tensor, starts: torch.Tensor, row: int) -> set:
+    """The flattened-K picks of a row as positions on its own causal grid."""
+    return {p - int(starts[row]) for p in positions[row].tolist() if p >= 0}
+
+
+def varlen_sparse_available() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    try:
+        import deep_gemm
+    except ImportError:
+        return False
+    return all(
+        callable(getattr(deep_gemm, name, None))
+        for name in (
+            "fp8_fp4_sparse_mqa_logits",
+            "get_sparse_mqa_logits_metadata",
+        )
     )
 
 
@@ -281,6 +386,87 @@ class TestPrefillSparseIndexer(CustomTestCase):
             torch.cuda.set_sync_debug_mode("default")
         rows = [3, 4, 12, 13, 14, 15, 16, 17, 18, 19]
         torch.testing.assert_close(tail.blocks, blocks[rows])
+
+
+@unittest.skipUnless(
+    varlen_sparse_available(), "DeepGEMM varlen sparse MQA logits unavailable"
+)
+class TestVarlenPrefillSparseIndexer(CustomTestCase):
+    @torch.inference_mode()
+    def test_publish_prefill_is_the_torch_block_selection(self):
+        """The published blocks equal `select_candidate_block_ids` block for block,
+        ascending with the newest block last, and the source's own top-k from the
+        same tiled pass is the dense one."""
+        for rows, ctx in CASES:
+            with self.subTest(rows=rows, ctx=ctx):
+                case = make_case(rows, ctx, seed=rows + ctx)
+                table, own = publish_varlen(case)
+                expected = reference_blocks(case)
+                nb = expected.shape[1]
+                # INT32_MAX padding lands in a spare column instead of a block
+                got = torch.zeros(rows, nb + 1, dtype=torch.bool, device="cuda")
+                got.scatter_(1, table.blocks.clamp_max(nb).long(), True)
+                self.assertTrue(torch.equal(got[:, :nb], expected))
+                self.assertFalse(got[0, :nb].any(), "an empty row keeps no block")
+                _, own_dense = publish_dense(case)
+                for r in range(rows):
+                    self.assertEqual(picks(own, r), picks(own_dense, r), r)
+
+    @torch.inference_mode()
+    def test_select_prefill_matches_the_dense_implementation(self):
+        """A consumer scoring only its blocks picks what the dense implementation
+        picks from the same inputs, up to bf16 rounding at the selection floor,
+        and never a position outside its blocks. A multi-request case starts a
+        request at an odd compressed offset, exercising unaligned ks."""
+        cases = [make_case(rows, ctx, seed=rows * 5 + ctx) for rows, ctx in CASES]
+        cases.append(make_multi_case([3001, 7005], [64, 96], seed=11))
+        for case in cases:
+            rows = case.data.num_rows
+            with self.subTest(rows=rows, ctx=case.data.lens_per_request):
+                got = select_varlen(publish_varlen(case)[0], case.data, case.kv)
+                want = select_dense(publish_dense(case)[0], case)
+                keep = reference_blocks(case).repeat_interleave(BLOCK, dim=1)
+                starts = case.data.request_starts
+                for r in range(rows):
+                    g = relative_picks(got, starts, r)
+                    w = relative_picks(want, starts, r)
+                    if case.lens[r] == 0:
+                        self.assertEqual(g, set(), r)
+                        continue
+                    self.assertEqual(len(g), len(w), r)
+                    self.assertTrue(
+                        keep[r, list(g)].all(), f"row {r}: outside its blocks"
+                    )
+                    self.assertGreaterEqual(len(g & w), MIN_OVERLAP * len(w), r)
+                    floor = case.dense[r, list(w)].min()
+                    self.assertTrue(
+                        (
+                            case.dense[r, list(g)]
+                            >= floor - floor.abs() * FLOOR_TOLERANCE
+                        ).all(),
+                        r,
+                    )
+
+    @torch.inference_mode()
+    def test_prefill_tail_rebuilds_the_last_rows(self):
+        """The tail table slices the blocks and lengths and rebuilds the varlen
+        schedule for its row set (it cannot be sliced); it selects what the full
+        table selects for those rows."""
+        rows, tail = 128, 16
+        case = make_case(rows, 20000, seed=7)
+        table, _ = publish_varlen(case)
+        idx = torch.arange(rows - tail, rows, device="cuda")
+        sub = table.tail([tail])
+        self.assertTrue(torch.equal(sub.blocks, table.blocks[idx]))
+        self.assertTrue(torch.equal(sub.valid_lens, table.valid_lens[idx]))
+        self.assertTrue(torch.equal(sub.compress_lens, table.compress_lens[idx]))
+        self.assertTrue(torch.equal(sub.request_starts, table.request_starts[idx]))
+
+        full = select_varlen(table, case.data, case.kv)
+        part = select_varlen(sub, rows_of(case.data, idx), case.kv)
+        for r in range(tail):
+            a, b = picks(full, rows - tail + r), picks(part, r)
+            self.assertGreaterEqual(len(a & b), MIN_TAIL_OVERLAP * len(a), r)
 
 
 if __name__ == "__main__":
