@@ -3,11 +3,13 @@ block selection and the dense implementation of the same protocol."""
 
 import unittest
 from typing import NamedTuple
+from unittest.mock import patch
 
 import msgspec
 import torch
 
 from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
+    candidate_row_lens,
     select_candidate_block_ids,
 )
 from sglang.kernels.ops.attention.dsv4.fp4_indexer import quantize_fp4_indexer_tensor
@@ -28,9 +30,9 @@ CASES = [(256, 40000), (64, 3000)]  # (query rows, context): above and below 204
 # fp32; picks a few bf16 ulps from the selection floor can go either way.
 MIN_OVERLAP = 0.95
 FLOOR_TOLERANCE = 2**-5
-# A tail table is a different DeepGEMM row set: its row pairing moves boundary
-# scores as well.
-MIN_TAIL_OVERLAP = 0.98
+# A tail or a budget-sized tile is a different DeepGEMM row set: its row pairing
+# moves a few boundary scores as well.
+MIN_TAIL_OVERLAP = 0.97
 
 
 class Case(NamedTuple):
@@ -158,12 +160,12 @@ def rows_of(data: DeepGEMMPrefillData, idx: torch.Tensor) -> DeepGEMMPrefillData
     )
 
 
-def reference_blocks(case: Case) -> torch.Tensor:
+def reference_blocks(case: Case, topk_blocks: int = TOPK_BLOCKS) -> torch.Tensor:
     """[rows, blocks] bool: the torch block selection of the dense scores."""
     j = torch.arange(case.dense.shape[1], device=case.dense.device)
     scores = case.dense.masked_fill(j[None, :] >= case.lens[:, None], -torch.inf)
     ids = select_candidate_block_ids(
-        scores, case.lens[:, None], topk_blocks=TOPK_BLOCKS, block_size=BLOCK
+        scores, case.lens[:, None], topk_blocks=topk_blocks, block_size=BLOCK
     ).to(torch.int64)
     num_blocks = -(-scores.shape[1] // BLOCK)
     keep = torch.zeros(
@@ -233,7 +235,7 @@ def select_dense(blocks, case: Case):
     )
 
 
-def publish_varlen(case: Case):
+def publish_varlen(case: Case, *, topk_blocks: int = TOPK_BLOCKS):
     """(the varlen sparse table, the source layer's own top-k)."""
     from sglang.srt.layers.attention.dsv4.v41_indexer.sparse_varlen import (
         publish_varlen_prefill,
@@ -245,7 +247,7 @@ def publish_varlen(case: Case):
         data=case.data,
         kv=case.kv,
         topk=TOPK,
-        topk_blocks=TOPK_BLOCKS,
+        topk_blocks=topk_blocks,
         out=Selection(page_indices=torch.empty_like(own), raw_indices=own),
     )
     return table, own
@@ -467,6 +469,38 @@ class TestVarlenPrefillSparseIndexer(CustomTestCase):
         for r in range(tail):
             a, b = picks(full, rows - tail + r), picks(part, r)
             self.assertGreaterEqual(len(a & b), MIN_TAIL_OVERLAP * len(a), r)
+
+    @torch.inference_mode()
+    def test_valid_lens_follow_the_logical_budget(self):
+        """A budget that is not a multiple of 4 keeps valid lengths on the logical
+        budget, not on the padded sparse-block stride."""
+        case = make_case(16, 81, seed=21)
+        table, _ = publish_varlen(case, topk_blocks=5)
+        _, want = candidate_row_lens(case.lens, 5)
+        self.assertTrue(torch.equal(table.valid_lens, want))
+        got = select_varlen(table, case.data, case.kv)
+        keep = reference_blocks(case, topk_blocks=5).repeat_interleave(BLOCK, dim=1)
+        for r in range(case.data.num_rows):
+            self.assertTrue(keep[r, list(picks(got, r))].all(), r)
+
+    @torch.inference_mode()
+    def test_chunked_consume_matches_the_full_schedule(self):
+        """Budget-sized row tiles rebuild their own schedules and select what the
+        single full-row schedule selects."""
+        case = make_case(128, 20000, seed=17)
+        full, _ = publish_varlen(case)
+        module = "sglang.srt.layers.attention.dsv4.v41_indexer.sparse_varlen"
+        with patch(f"{module}._sparse_logits_rows_per_chunk", return_value=16):
+            chunked, _ = publish_varlen(case)
+        self.assertEqual(chunked.chunk_rows, 16)
+        self.assertEqual(len(chunked.schedules), 8)
+        got = select_varlen(chunked, case.data, case.kv)
+        want = select_varlen(full, case.data, case.kv)
+        for r in range(case.data.num_rows):
+            a, b = picks(got, r), picks(want, r)
+            # Tiles change the DeepGEMM split scheduling; allow the same bf16
+            # selection-floor tolerance as the dense comparison.
+            self.assertGreaterEqual(len(a & b), MIN_OVERLAP * len(b), r)
 
 
 if __name__ == "__main__":
